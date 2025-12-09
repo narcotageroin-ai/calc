@@ -27,17 +27,25 @@ st.markdown(
 
 @st.cache_data
 def load_excel(file) -> pd.DataFrame:
-    return pd.read_excel(file)
+    df = pd.read_excel(file)
+    df.columns = df.columns.map(str)  # важно!
+    return df
+
 
 
 def guess_column(columns, keywords):
     """Пытаемся угадать колонку по ключевым словам (без учета регистра)."""
+    # Гарантируем, что все имена колонок — строки
+    columns = [str(c) for c in columns]
     cols_lower = [c.lower() for c in columns]
+
     for kw in keywords:
+        kw = kw.lower()
         for i, c in enumerate(cols_lower):
             if kw in c:
                 return i
     return 0
+
 
 
 def calc_for_row(

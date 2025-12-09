@@ -28,24 +28,21 @@ st.markdown(
 @st.cache_data
 def load_excel(file) -> pd.DataFrame:
     df = pd.read_excel(file)
-    df.columns = df.columns.map(str)  # важно!
+    # На всякий случай приводим имена колонок к строкам
+    df.columns = df.columns.map(str)
     return df
-
 
 
 def guess_column(columns, keywords):
     """Пытаемся угадать колонку по ключевым словам (без учета регистра)."""
-    # Гарантируем, что все имена колонок — строки
     columns = [str(c) for c in columns]
     cols_lower = [c.lower() for c in columns]
-
     for kw in keywords:
         kw = kw.lower()
         for i, c in enumerate(cols_lower):
             if kw in c:
                 return i
     return 0
-
 
 
 def calc_for_row(
@@ -62,7 +59,6 @@ def calc_for_row(
     logistics_extra_per_liter: float,
     packaging_cost: float,
     spp_pct: float,
-    purchase_vat_rate: float = 20.0,
     min_margin_pct: float = 10.0,
 ) -> dict:
     """Выполняет расчет для одной строки DataFrame. Возвращает словарь с результатами.
@@ -79,13 +75,11 @@ def calc_for_row(
 
     # 2. Стоимость логистики:
     #    стоимость за первый литр + за каждый дополнительный литр.
-    #    Используем "плавную" формулу, которая совпадает с примером при целых литрах.
     extra_liters = max(volume_liters - 1.0, 0.0)
     logistics_cost = logistics_base_per_liter + logistics_extra_per_liter * extra_liters if volume_liters > 0 else 0.0
 
     # 3. Наценка "от обратного":
     #    хотим, чтобы закупка была (1 - markup_pct) от цены без учета логистики/упаковки.
-    #    Например, при 25% маржи закупка = 75% цены, => цена = закупка / 0.75.
     markup_factor = 1.0 - markup_pct / 100.0 if markup_pct < 100 else 0.0001
     base_price_with_markup = purchase_price / markup_factor if markup_factor > 0 else purchase_price
 
@@ -100,11 +94,8 @@ def calc_for_row(
     else:
         sale_price_initial = total_non_commission_cost / denom
 
-    # 6. Вычисляем НДС и маржу при данной цене,
-    #    и при необходимости корректируем цену так, чтобы маржа была не менее min_margin_pct.
-
-    # Входящий НДС с закупки (предполагаем, что закупочная цена с НДС)
-    purchase_vat = purchase_price * purchase_vat_rate / (100.0 + purchase_vat_rate)
+    # 6. Входящий НДС: теперь считаем по той же ставке, что и исходящий (например, 22/122)
+    purchase_vat = purchase_price * vat_sale_rate / (100.0 + vat_sale_rate)
 
     def compute_profit_and_margin(price: float):
         # Комиссия и эквайринг
@@ -112,14 +103,16 @@ def calc_for_row(
         acquiring_cost = price * acquiring_pct / 100.0
 
         # Исходящий НДС по ставке vat_sale_rate, с учетом СПП (co-invest)
-        # Общая логика: НДС считается с цены после учета СПП.
+        # Формула: (цена продажи - СПП) * vat_sale_rate / (100 + vat_sale_rate)
         if vat_sale_rate > 0:
-            outgoing_vat = price * (1.0 - spp_pct / 100.0) * vat_sale_rate / (100.0 + vat_sale_rate)
+            base_for_vat = price * (1.0 - spp_pct / 100.0)
+            outgoing_vat = base_for_vat * vat_sale_rate / (100.0 + vat_sale_rate)
         else:
             outgoing_vat = 0.0
 
         vat_to_pay = outgoing_vat - purchase_vat
 
+        # Полная прибыль после всех затрат и НДС
         profit = (
             price
             - purchase_price
@@ -130,13 +123,31 @@ def calc_for_row(
             - vat_to_pay
         )
 
-        margin_pct = (profit / price * 100.0) if price > 0 else 0.0
-        return profit, margin_pct, outgoing_vat, vat_to_pay, commission_cost, acquiring_cost
+        # База для расчета маржинальности:
+        # деньги, оставшиеся после оплаты комиссий МП, эквайринга и логистики
+        margin_base = price - commission_cost - acquiring_cost - logistics_cost
+
+        margin_pct = (profit / margin_base * 100.0) if margin_base > 0 else 0.0
+        return (
+            profit,
+            margin_pct,
+            outgoing_vat,
+            vat_to_pay,
+            commission_cost,
+            acquiring_cost,
+            margin_base,
+        )
 
     # Считаем для исходной цены
-    profit_initial, margin_initial, outgoing_vat_initial, vat_to_pay_initial, commission_cost_initial, acquiring_cost_initial = compute_profit_and_margin(
-        sale_price_initial
-    )
+    (
+        profit_initial,
+        margin_initial,
+        outgoing_vat_initial,
+        vat_to_pay_initial,
+        commission_cost_initial,
+        acquiring_cost_initial,
+        margin_base_initial,
+    ) = compute_profit_and_margin(sale_price_initial)
 
     # Если маржа >= минимальной — оставляем эту цену
     if margin_initial >= min_margin_pct:
@@ -149,42 +160,73 @@ def calc_for_row(
         acquiring_cost_final = acquiring_cost_initial
     else:
         # Решаем задачу аналитически: найти цену, при которой маржа = min_margin_pct
-        # Пусть p — цена.
-        # profit(p) = p - c - l - u - p*k - p*a - VAT(p)
-        # где VAT(p) = p*(1 - spp)*v/(100+v) - purchase_vat
-        # profit(p) = p * [1 - k - a - (1 - spp)*v/(100+v)] - (c + l + u - purchase_vat)
-        # Маржа m = profit(p) / p.
-        # m = A - B / p, где
-        # A = 1 - k - a - (1 - spp)*v/(100+v),
-        # B = c + l + u - purchase_vat.
-        # Тогда для m = min_margin: p = B / (A - m).
+        # Обозначения:
+        #   k = комиссия МП (доля)
+        #   a = эквайринг (доля)
+        #   v = ставка НДС (в процентах, например 22)
+        #   s = СПП (доля)
+        #   m = целевая маржа (доля, например 0.1 для 10%)
+        #
+        # profit(p) = A * p - B
+        # margin_base(p) = C * p - l
+        #
+        # где:
+        #   A = 1 - k - a - (1 - s) * v / (100 + v)
+        #   B = purchase_price + logistics_cost + packaging_cost - purchase_vat
+        #   C = 1 - k - a
+        #   l = logistics_cost
+        #
+        # Требуемая маржа:
+        #   m = profit(p) / margin_base(p)
+        #   m = (A*p - B) / (C*p - l)
+        #
+        # => A*p - B = m*(C*p - l)
+        # => p*(A - m*C) = B - m*l
+        # => p = (B - m*l) / (A - m*C)
         k = commission_pct / 100.0
         a = acquiring_pct / 100.0
         v = vat_sale_rate
         s = spp_pct / 100.0
         m = min_margin_pct / 100.0
 
-        A = 1.0 - k - a - ((1.0 - s) * v / (100.0 + v) if v > 0 else 0.0)
+        if v > 0:
+            A = 1.0 - k - a - (1.0 - s) * v / (100.0 + v)
+        else:
+            A = 1.0 - k - a
         B = purchase_price + logistics_cost + packaging_cost - purchase_vat
+        C = 1.0 - k - a
+        l = logistics_cost
 
-        if A <= m:
+        denom_price = A - m * C
+        numer_price = B - m * l
+
+        if denom_price <= 0:
             # Теоретически невозможно достичь такую маржу при разумной цене,
             # поэтому просто используем исходную цену и маржу.
             sale_price_final = sale_price_initial
-            profit_final = profit_initial
-            margin_final = margin_initial
-            outgoing_vat_final = outgoing_vat_initial
-            vat_to_pay_final = vat_to_pay_initial
-            commission_cost_final = commission_cost_initial
-            acquiring_cost_final = acquiring_cost_initial
+            (
+                profit_final,
+                margin_final,
+                outgoing_vat_final,
+                vat_to_pay_final,
+                commission_cost_final,
+                acquiring_cost_final,
+                _,
+            ) = compute_profit_and_margin(sale_price_final)
         else:
-            price_for_min_margin = B / (A - m)
+            price_for_min_margin = numer_price / denom_price
             # На всякий случай не даем цене стать ниже исходной
             sale_price_final = max(sale_price_initial, price_for_min_margin)
 
-            profit_final, margin_final, outgoing_vat_final, vat_to_pay_final, commission_cost_final, acquiring_cost_final = compute_profit_and_margin(
-                sale_price_final
-            )
+            (
+                profit_final,
+                margin_final,
+                outgoing_vat_final,
+                vat_to_pay_final,
+                commission_cost_final,
+                acquiring_cost_final,
+                _,
+            ) = compute_profit_and_margin(sale_price_final)
 
     return {
         "Объем, л": volume_liters,
@@ -275,7 +317,12 @@ if uploaded_file is not None:
             )
 
     min_margin_pct = 10.0
-    st.info(f"Минимальная целевая маржа после всех затрат и НДС: **{min_margin_pct:.0f}%**")
+    st.info(
+        "Минимальная целевая маржа после всех затрат и НДС: "
+        f"**{min_margin_pct:.0f}%**. "
+        "При этом маржа считается не от цены реализации, а от суммы, "
+        "которая остается после вычета комиссии МП, эквайринга и логистики."
+    )
 
     if st.button("🔢 Рассчитать цены"):
         # Приводим числовые столбцы к float (если там текст/строки)
